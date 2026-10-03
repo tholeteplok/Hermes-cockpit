@@ -1,0 +1,23 @@
+# Credentials & Keys
+*.key
+*.crt
+*.pem
+.cockpit_token
+*.env
+*.token
+
+# Python cache & virtualenv
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+
+# Backup & temporary files
+*.bak
+*.backup
+*.cat-backup
+*.dual_bak
+*~
+*.swp
+*.tmp
