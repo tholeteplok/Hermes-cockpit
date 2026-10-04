@@ -3,7 +3,7 @@
 Includes all utilities from cockpit.py merged into single executable.
 Jalankan: python3 cockpit_v2_standalone.py [--token RAHASIA] [--port 8080]
 """
-import os, sys, json, hmac, secrets, argparse, platform, glob, re, html, socket, subprocess, threading, time
+import os, sys, json, hmac, secrets, argparse, platform, glob, re, html, socket, subprocess, threading, time, sqlite3
 from datetime import datetime
 from urllib.parse import urlparse, parse_qs
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -48,6 +48,133 @@ def redact_secrets(text):
     for pat in SECRET_PATTERNS:
         result = pat.sub(r'\1***[REDACTED_SECRET]***', result)
     return result
+
+# === USAGE READER (tab Penggunaan) ===
+_USAGE_CACHE = {"at": 0.0, "data": None}
+def read_usage():
+    """Pemakaian LLM ala 9router: overview cards + chart 24 jam + aktivitas terakhir.
+    Sumber utama: session_model_usage (menyimpan nama model aktual: 9combo/9new/dll).
+    Cache 30 detik agar polling ringan."""
+    now = time.time()
+    if _USAGE_CACHE["data"] and now - _USAGE_CACHE["at"] < 30:
+        return _USAGE_CACHE["data"]
+    db_path = os.path.join(HERMES_DIR, "state.db")
+    out = {"model": "-", "provider": "-", "in_tokens": 0, "out_tokens": 0,
+           "cache_read": 0, "reasoning": 0, "sessions": 0, "calls": 0,
+           "today_in": 0, "today_out": 0, "cost_usd": 0.0,
+           "models": [], "chart": [], "recent": [], "updated_at": now}
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=3)
+        cur = con.cursor()
+        day_start = now - 86400
+
+        # --- model yang sedang berjalan (last_seen terbaru) ---
+        cur.execute("""SELECT model, billing_provider, last_seen,
+                              input_tokens, output_tokens,
+                              COALESCE(cache_read_tokens,0), COALESCE(reasoning_tokens,0)
+                       FROM session_model_usage
+                       WHERE model IS NOT NULL
+                       ORDER BY last_seen DESC LIMIT 1""")
+        r = cur.fetchone()
+        if r and r[0]:
+            out["model"] = r[0]
+            out["provider"] = (r[1] or "-").replace("custom:", "custom · ")
+            out["active_since"] = r[2]
+            out["in_tokens"], out["out_tokens"] = r[3] or 0, r[4] or 0
+            out["cache_read"], out["reasoning"] = r[5], r[6]
+
+        # --- overview 24 jam (cards ala 9router) ---
+        cur.execute("""SELECT COUNT(DISTINCT session_id),
+                              COALESCE(SUM(input_tokens),0),
+                              COALESCE(SUM(output_tokens),0),
+                              COALESCE(SUM(api_call_count),0),
+                              COALESCE(SUM(estimated_cost_usd),0)+COALESCE(SUM(actual_cost_usd),0)
+                       FROM session_model_usage WHERE last_seen >= ?""", (day_start,))
+        n, ti, to, calls, cost = cur.fetchone()
+        out["sessions"], out["today_in"] = n or 0, ti or 0
+        out["today_out"], out["calls"], out["cost_usd"] = to or 0, calls or 0, cost or 0.0
+
+        # --- chart: token per jam (24 bucket) ---
+        cur.execute("""SELECT CAST(last_seen/3600 AS INTEGER) AS h,
+                              COALESCE(SUM(input_tokens),0),
+                              COALESCE(SUM(output_tokens),0)
+                       FROM session_model_usage WHERE last_seen >= ?
+                       GROUP BY h ORDER BY h""", (day_start,))
+        buckets = {}
+        for h, i, o in cur.fetchall():
+            buckets[h] = [i, o]
+        # lengkapi jam kosong agar chart mulus dari -24h s/d sekarang
+        base = int(now // 3600) - 23
+        out["chart"] = [{"h": base + k,
+                         "in": buckets.get(base + k, [0, 0])[0],
+                         "out": buckets.get(base + k, [0, 0])[1]} for k in range(24)]
+
+        # --- SECTION 1: pemakaian berdasarkan COMBO (alias: 9combo/9new/gemini) ---
+        COMBO_ALIASES = ("9combo", "9new", "gemini")
+        cur.execute("""SELECT model, COALESCE(SUM(api_call_count),0),
+                              COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+                              COUNT(DISTINCT session_id)
+                       FROM session_model_usage
+                       WHERE last_seen >= ? AND model IS NOT NULL
+                       GROUP BY model
+                       ORDER BY (SUM(input_tokens)+SUM(output_tokens)) DESC""",
+                    (day_start,))
+        combos, direct = {}, {"model": "Model langsung (tanpa combo)", "calls": 0,
+                              "in": 0, "out": 0, "sessions": 0}
+        for m, c, i, o, s in cur.fetchall():
+            if (m or "").lower() in COMBO_ALIASES:
+                combos[m] = {"model": m, "calls": c, "in": i, "out": o, "sessions": s}
+            else:
+                direct["calls"] += c; direct["in"] += i
+                direct["out"] += o; direct["sessions"] += s
+        # urut tetap sesuai daftar combo + gabungkan nama combo case-different
+        out["combos"] = [combos[k] for k in sorted(combos, key=lambda x: -combos[x]["in"])]
+        if direct["calls"]:
+            out["combos"].append(direct)
+
+        # --- SECTION 2: pemakaian berdasarkan MODEL ASLI (dari 9router usageHistory) ---
+        out["models"] = []
+        try:
+            rdb = os.path.expanduser("~/.9router/db/data.sqlite")
+            rcon = sqlite3.connect(f"file:{rdb}?mode=ro", uri=True, timeout=3)
+            rcur = rcon.cursor()
+            cut = rcur.execute("SELECT strftime('%Y-%m-%dT%H:%M:%f','now','-1 day')").fetchone()[0]
+            rcur.execute("""SELECT model, provider, COUNT(*),
+                                   COALESCE(SUM(promptTokens),0),
+                                   COALESCE(SUM(completionTokens),0)
+                            FROM usageHistory
+                            WHERE timestamp >= ? AND model IS NOT NULL
+                            GROUP BY model, provider
+                            ORDER BY (SUM(promptTokens)+SUM(completionTokens)) DESC""",
+                         (cut,))
+            agg = {}
+            for m, prov, n, pi, po in rcur.fetchall():
+                a = agg.setdefault(m, {"model": m, "provider": prov, "calls": 0, "in": 0, "out": 0})
+                a["calls"] += n; a["in"] += pi or 0; a["out"] += po or 0
+            out["models"] = sorted(agg.values(), key=lambda x: -(x["in"] + x["out"]))[:20]
+            rcon.close()
+        except Exception as e:
+            out["models_error"] = str(e)
+
+        # --- aktivitas terakhir (recent, ala 9router live table) ---
+        cur.execute("""SELECT u.session_id, u.model, u.last_seen,
+                              u.input_tokens, u.output_tokens,
+                              COALESCE(u.api_call_count,0), u.task,
+                              COALESCE(s.title,''), COALESCE(s.end_reason,''),
+                              COALESCE(s.last_activity_description,'')
+                       FROM session_model_usage u
+                       LEFT JOIN sessions s ON s.id = u.session_id
+                       WHERE u.model IS NOT NULL
+                       ORDER BY u.last_seen DESC LIMIT 12""")
+        out["recent"] = [{"sid": rid, "model": m, "ts": ts, "in": i or 0, "out": o or 0,
+                          "calls": c, "task": task or "", "title": (title or "").strip() or rid,
+                          "state": st or "", "desc": desc or ""}
+                         for rid, m, ts, i, o, c, task, title, st, desc in cur.fetchall()]
+        con.close()
+    except Exception as e:
+        out["error"] = str(e)
+    _USAGE_CACHE.update(at=now, data=out)
+    return out
 
 # === HERMES DATA READERS ===
 def read_heartbeat():
@@ -874,9 +1001,64 @@ body.virtual-landscape nav {
   <div class="card">
     <button class="b" style="width:100%;color:var(--bad);border-color:rgba(255,122,107,0.3)" onclick="logout()">Keluar dari Cockpit</button>
   </div>
-</div></main>
+</div>
+
+<!-- ===== Tab Penggunaan (Usage) ===== -->
+<div id="v-usage" hidden>
+  <div class="sec">Penggunaan Model LLM <span id="usage-live" style="color:var(--mut);font-weight:400;font-size:12px"></span></div>
+  <div class="card">
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+      <span id="usage-pulse" style="width:10px;height:10px;border-radius:50%;background:var(--ok);box-shadow:0 0 8px var(--ok)"></span>
+      <b id="usage-model" style="font:600 16px var(--mono)">memuat…</b>
+      <span id="usage-provider" style="font-size:12px;color:var(--mut)"></span>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px">
+      <div style="background:var(--s2);border:1px solid var(--line);border-radius:10px;padding:10px 12px">
+        <div style="font-size:11.5px;color:var(--mut);text-transform:uppercase;letter-spacing:.5px">Token In</div>
+        <div id="usage-in" style="font:700 20px var(--mono);color:var(--brass)">0</div>
+      </div>
+      <div style="background:var(--s2);border:1px solid var(--line);border-radius:10px;padding:10px 12px">
+        <div style="font-size:11.5px;color:var(--mut);text-transform:uppercase;letter-spacing:.5px">Token Out</div>
+        <div id="usage-out" style="font:700 20px var(--mono);color:var(--ok)">0</div>
+      </div>
+      <div style="background:var(--s2);border:1px solid var(--line);border-radius:10px;padding:10px 12px">
+        <div style="font-size:11.5px;color:var(--mut);text-transform:uppercase;letter-spacing:.5px">Cache Read</div>
+        <div id="usage-cache" style="font:700 20px var(--mono)">0</div>
+      </div>
+      <div style="background:var(--s2);border:1px solid var(--line);border-radius:10px;padding:10px 12px">
+        <div style="font-size:11.5px;color:var(--mut);text-transform:uppercase;letter-spacing:.5px">Estimasi Biaya</div>
+        <div id="usage-cost" style="font:700 20px var(--mono)">$0</div>
+      </div>
+    </div>
+    <div style="margin-top:10px;font-size:12.5px;color:var(--mut)">Total 24 jam: <b id="usage-today" style="color:var(--tx)">-</b> token dari <b id="usage-sessions" style="color:var(--tx)">0</b> sesi · <b id="usage-calls" style="color:var(--tx)">0</b> panggilan API</div>
+  </div>
+  <div class="sec">Chart Token / Jam (24 jam)</div>
+  <div class="card">
+    <div style="display:flex;gap:8px">
+      <div id="usage-chart-y" style="position:relative;width:44px;height:150px;flex:none"></div>
+      <div style="flex:1;position:relative;height:150px">
+        <div id="usage-chart-grid" style="position:absolute;inset:0;display:flex;flex-direction:column"></div>
+        <div id="usage-chart" style="position:relative;height:100%;display:flex;align-items:flex-end;gap:3px;z-index:1"></div>
+      </div>
+    </div>
+    <div id="usage-chart-x" style="position:relative;height:16px;margin-top:6px"></div>
+    <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;font-size:11px;color:var(--mut);margin-top:6px">
+      <span>■ <span style="color:var(--brass)">in</span> &nbsp; <span style="color:var(--ok)">out</span></span>
+      <span id="usage-chart-sum"></span>
+      <span id="usage-chart-peak" style="color:var(--tx)"></span>
+    </div>
+  </div>
+  <div class="sec">Berdasarkan Combo (24 jam)</div>
+  <div id="usage-combos"></div>
+  <div class="sec">Berdasarkan Model Asli (24 jam) <span style="font-weight:400;font-size:11px;color:var(--mut)">— via 9router</span></div>
+  <div id="usage-models"></div>
+  <div class="sec">Aktivitas Terakhir</div>
+  <div id="usage-recent"></div>
+</div>
+</main>
 <nav id="nav"><button class="on" data-t="jobs"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>Tugas</button>
 <button data-t="act"><svg viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg>Aktivitas</button>
+<button data-t="usage"><svg viewBox="0 0 24 24"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>Penggunaan</button>
 <button data-t="dev"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>Pengaturan</button></nav>
 <div id="toast"></div>
 <script>
@@ -1048,12 +1230,120 @@ async function executeCommandCenter(cmd, customLabel){
 function start(){$('login').style.display='none';$('app').style.display='block';$('nav').style.display='flex';poll();clearInterval(timer);timer=setInterval(poll,4000)}
 document.addEventListener('visibilitychange',()=>{if(!tok)return;clearInterval(timer);if(!document.hidden){poll();timer=setInterval(poll,4000)}});
 document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{document.querySelectorAll('nav button').forEach(x=>x.classList.toggle('on',x===b));
-['jobs','act','dev'].forEach(t=>$('v-'+t).hidden=t!==b.dataset.t);
+['jobs','act','dev','usage'].forEach(t=>$('v-'+t).hidden=t!==b.dataset.t);
   const heroEl = $('hero');
   if(heroEl) heroEl.style.display = (b.dataset.t === 'jobs') ? 'block' : 'none';
   if(b.dataset.t==='dev'){renderNodes();updatePushBtnUI();}
+  if(b.dataset.t==='usage'){renderUsage();}
   window.scrollTo({top: 0, behavior: 'instant'});
 });
+
+// ===== Tab Penggunaan: fetch & render token usage =====
+function fmtTok(n){n=Number(n)||0;if(n>=1e6)return (n/1e6).toFixed(2)+'M';if(n>=1e3)return (n/1e3).toFixed(1)+'k';return String(n)}
+async function renderUsage(){
+  try{
+    const d = await api('/api/usage');
+    if($('v-usage').hidden) return;
+    $('usage-model').textContent = d.model || '-';
+    $('usage-provider').textContent = d.provider && d.provider!=='-' ? 'provider: '+d.provider : '';
+    $('usage-in').textContent = fmtTok(d.in_tokens);
+    $('usage-out').textContent = fmtTok(d.out_tokens);
+    $('usage-cache').textContent = fmtTok(d.cache_read);
+    $('usage-cost').textContent = '$'+(Number(d.cost_usd)||0).toFixed(3);
+    $('usage-today').textContent = fmtTok((d.today_in||0)+(d.today_out||0));
+    $('usage-sessions').textContent = d.sessions||0;
+    $('usage-calls').textContent = d.calls||0;
+    $('usage-live').textContent = 'diperbarui '+new Date().toLocaleTimeString('id-ID');
+    // chart token per jam (stacked bar in/out) + sumbu, grid, label jam, puncak
+    const ch = d.chart||[];
+    if(ch.length){
+      const tots = ch.map(c=>(c.in||0)+(c.out||0));
+      const mx = Math.max(...tots)||1;
+      const hr = h => new Date(h*3600e3).getHours();
+      const hhOf = h => new Date(h*3600e3).toLocaleTimeString('id-ID',{hour:'2-digit',minute:'2-digit'});
+      // --- sumbu Y: 5 label (0 s/d mx) ---
+      $('usage-chart-y').innerHTML = [0,1,2,3,4].map(k=>{
+        const v = Math.round(mx*(4-k)/4);
+        return '<div style="position:absolute;right:0;top:'+(k*25)+'%;transform:translateY(-50%);font-size:10px;color:var(--mut)">'+fmtTok(v)+'</div>';
+      }).join('');
+      // --- gridline horizontal ---
+      $('usage-chart-grid').innerHTML = [0,1,2,3,4].map(k=>
+        '<div style="position:absolute;left:0;right:0;top:'+(k*25)+'%;border-top:1px '+(k===4?'solid':'dashed')+' var(--line);opacity:'+(k===4?1:.5)+'"></div>').join('');
+      // --- bar + penanda puncak ---
+      const peak = tots.indexOf(Math.max(...tots));
+      $('usage-chart').innerHTML = ch.map((c,i)=>{
+        const ti=(c.in||0), to=(c.out||0);
+        const hh=Math.max(2, Math.round((ti+to)/mx*100));
+        const hhIn=Math.round(ti/(ti+to||1)*hh);
+        const tip = hhOf(c.h)+' · in '+fmtTok(ti)+' · out '+fmtTok(to);
+        const isPeak = i===peak && tots[peak]>0;
+        const barStyle = isPeak? ';outline:1.5px solid var(--brass);outline-offset:-1px' : '';
+        const mark = isPeak? '<div style="position:absolute;top:0;left:50%;transform:translate(-50%,-110%);font-size:9.5px;color:var(--brass);white-space:nowrap;font-weight:600">▲'+fmtTok(tots[peak])+'</div>' : '';
+        return '<div title="'+tip+'" style="flex:1;display:flex;flex-direction:column;justify-content:flex-end;height:100%;min-width:0;position:relative">'+mark+
+          '<div style="height:'+(hh-hhIn)+'%;background:var(--ok);border-radius:2px 2px 0 0;min-height:'+(to?2:0)+'px"></div>'+
+          '<div style="height:'+hhIn+'%;background:var(--brass);border-radius:0 0 2px 2px;min-height:'+(ti?2:0)+'px'+barStyle+'"></div></div>';
+      }).join('');
+      // --- sumbu X: label jam aktual tiap 6 jam + sekarang ---
+      const lbls = [{k:0,lab:hr(ch[0].h)+':00'},{k:6,lab:hr(ch[6]?ch[6].h:ch[0].h+6)+':00'},
+                    {k:12,lab:hr(ch[12]?ch[12].h:ch[0].h+12)+':00'},{k:18,lab:hr(ch[18]?ch[18].h:ch[0].h+18)+':00'},
+                    {k:23,lab:'sekarang'}];
+      $('usage-chart-x').innerHTML = lbls.map(L=>{
+        const pos = ((L.k+0.5)/ch.length)*100;
+        return '<div style="position:absolute;left:'+pos+'%;transform:translateX(-50%);font-size:10px;color:var(--mut);white-space:nowrap">'+L.lab+'</div>';
+      }).join('');
+      // --- ringkasan: total in/out + jam puncak ---
+      const si = ch.reduce((a,c)=>a+(c.in||0),0), so = ch.reduce((a,c)=>a+(c.out||0),0);
+      $('usage-chart-sum').innerHTML = 'total 24j: <b style="color:var(--brass)">in '+fmtTok(si)+'</b> · <b style="color:var(--ok)">out '+fmtTok(so)+'</b>';
+      const pc = ch[peak];
+      $('usage-chart-peak').innerHTML = tots[peak]>0 ? '▲ puncak '+hhOf(pc.h)+' ('+fmtTok(tots[peak])+')' : '';
+    } else {
+      $('usage-chart').innerHTML='<div class="empty">Belum ada data chart</div>';
+      $('usage-chart-y').innerHTML=''; $('usage-chart-x').innerHTML='';
+      $('usage-chart-grid').innerHTML=''; $('usage-chart-sum').textContent=''; $('usage-chart-peak').textContent='';
+    }
+    // bar pemakaian (dipakai untuk section combo & model asli)
+    function barRows(rows, opts){
+      opts = opts || {};
+      if(!rows || !rows.length) return '<div class="empty">Belum ada pemakaian 24 jam terakhir</div>';
+      const max = Math.max(...rows.map(m=>(m.in||0)+(m.out||0)))||1;
+      return rows.map(m=>{
+        const tot=(m.in||0)+(m.out||0), pct=Math.round(tot/max*100);
+        const meta = [opts.prefix||'', (m.calls||0)+' panggilan',
+                      (m.sessions? m.sessions+' sesi':''),
+                      (m.provider? esc(m.provider):'')].filter(Boolean).join(' · ');
+        return '<div class="card" style="margin-bottom:8px">'+
+          '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px"><b style="font:600 14px var(--mono)'+(opts.accent?';color:var(--brass)':'')+'">'+esc(m.model)+'</b>'+
+          '<span style="font-size:12px;color:var(--mut);text-align:right">'+meta+'</span></div>'+
+          '<div style="height:8px;background:var(--s2);border-radius:4px;margin:8px 0;overflow:hidden"><div style="width:'+pct+'%;height:100%;background:'+(opts.color||'var(--brass)')+';border-radius:4px"></div></div>'+
+          '<div style="font:12.5px var(--mono);color:var(--mut)">in '+fmtTok(m.in)+' · out '+fmtTok(m.out)+'</div></div>';
+      }).join('');
+    }
+    $('usage-combos').innerHTML = barRows(d.combos, {accent:true});
+    $('usage-models').innerHTML = barRows(d.models, {color:'var(--ok)'});
+    // aktivitas terakhir (tabel live ala 9router)
+    const rbox = $('usage-recent');
+    const rec = d.recent||[];
+    if(!rec.length){rbox.innerHTML='<div class="empty">Belum ada aktivitas</div>';}
+    else{
+      rbox.innerHTML = rec.map(r=>{
+        const ago = Math.max(0, Math.round((Date.now()/1000 - r.ts)/60));
+        const agoTxt = ago<1 ? 'baru saja' : ago<60 ? ago+' mnt lalu' : Math.round(ago/60)+' jam lalu';
+        const dot = ago<5 ? 'var(--ok)' : ago<60 ? 'var(--brass)' : 'var(--mut)';
+        const st = r.state==='completed'||r.state==='end_turn' ? '' : (r.state? ' · '+esc(r.state) : '');
+        return '<div class="card" style="margin-bottom:6px;padding:10px 12px">'+
+          '<div style="display:flex;justify-content:space-between;gap:8px;align-items:center">'+
+          '<div style="display:flex;gap:8px;align-items:center;min-width:0">'+
+          '<span style="width:8px;height:8px;border-radius:50%;background:'+dot+';flex:none;box-shadow:0 0 6px '+dot+'"></span>'+
+          '<b style="font:600 13px var(--mono);color:var(--brass)">'+esc(r.model)+'</b></div>'+
+          '<span style="font-size:11.5px;color:var(--mut);flex:none">'+agoTxt+'</span></div>'+
+          '<div style="font-size:12.5px;margin-top:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+esc(r.title)+st+'</div>'+
+          '<div style="font:11.5px var(--mono);color:var(--mut);margin-top:3px">in '+fmtTok(r.in)+' · out '+fmtTok(r.out)+' · '+r.calls+' panggilan</div></div>';
+      }).join('');
+    }
+  }catch(e){
+    if(!$('v-usage').hidden) $('usage-models').innerHTML='<div class="empty">Gagal memuat: '+esc(e.message)+'</div>';
+  }
+}
 
 let currentAlerts = [];
 let lastSeenAlertMtime = 0;
@@ -1218,7 +1508,7 @@ toggleNotifDrawer = function(force){
   updatePushBtnUI();
 };
 
-async function poll(){try{const d=await api('/api/state');$('banner').style.display='none';hero(d.heartbeat);scene(d.mascot);updateTgMascot(d.tg_mascot);$('host').textContent=d.hostname;$('plat').textContent=d.platform;jobs(d.cron_jobs);acts(d.tools);renderAlerts(d.alerts)}
+async function poll(){try{const d=await api('/api/state');$('banner').style.display='none';hero(d.heartbeat);scene(d.mascot);updateTgMascot(d.tg_mascot);$('host').textContent=d.hostname;$('plat').textContent=d.platform;jobs(d.cron_jobs);acts(d.tools);renderAlerts(d.alerts);if(!$('v-usage').hidden)renderUsage()}
 catch(e){if(e.message!=='auth')$('banner').style.display='block'}}
 
 let lastHeartbeat = {fresh: true, status: 'online'};
@@ -1906,6 +2196,9 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/sw.js":
             sw_code = "self.addEventListener('install', e => self.skipWaiting()); self.addEventListener('activate', e => self.clients.claim()); self.addEventListener('fetch', e => e.respondWith(fetch(e.request))); self.addEventListener('message', e => { if(e.data && e.data.type === 'SHOW_NOTIFICATION'){ self.registration.showNotification(e.data.title, { body: e.data.body, icon: '/icon-192.png', badge: '/icon-192.png' }); } });"
             return self._send(200, sw_code.encode(), "application/javascript; charset=utf-8")
+        if p == "/api/usage":
+            if not self._authed(): return self._send(401, {"error": "unauthorized"})
+            return self._send(200, read_usage())
         if p == "/api/state":
             if not self._authed(): return self._send(401, {"error": "unauthorized"})
             return self._send(200, {"hostname": HOSTNAME, "platform": platform.system(), "heartbeat": read_heartbeat(),
